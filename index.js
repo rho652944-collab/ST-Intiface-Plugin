@@ -12,12 +12,12 @@
     // Hard safety limits: these are enforced in code, not supplied by the model.
     const LIMITS = Object.freeze({
         defaultIntensity: 0.10,
-        maxIntensity: 0.20,
+        maxIntensity: 0.80,
         defaultDurationMs: 1000,
         minDurationMs: 250,
         maxDurationMs: 2000,
         maxActionsPerReply: 8,
-        maxTotalDurationMs: 10000,
+        maxRunDurationMs: 35000,
         gapBetweenActionsMs: 300,
     });
 
@@ -118,8 +118,9 @@
                 </div>
                 <div style="font-size:12px;line-height:1.6;opacity:.85">
                   每条 AI 回复最多 ${LIMITS.maxActionsPerReply} 个动作；单动作最长 ${LIMITS.maxDurationMs / 1000} 秒；
-                  单条回复累计最长 ${LIMITS.maxTotalDurationMs / 1000} 秒；强度硬上限 ${Math.round(LIMITS.maxIntensity * 100)}%。
-                  多个 &lt;toy&gt; 标签按出现顺序执行一次，不循环。
+                  AI 回复中的动作序列按顺序循环，最长 ${LIMITS.maxRunDurationMs / 1000} 秒；
+                  单动作最长 ${LIMITS.maxDurationMs / 1000} 秒；强度硬上限 ${Math.round(LIMITS.maxIntensity * 100)}%。
+                  每轮最多 ${LIMITS.maxActionsPerReply} 个动作；手动测试仍只执行一次。
                 </div>
               </div>
               <div class="if-section">
@@ -478,23 +479,20 @@
 
     function applyHardLimits(parsed) {
         const safe = [];
-        let remainingMs = LIMITS.maxTotalDurationMs;
 
         for (const original of parsed) {
             if (original.stop) {
                 safe.push({ stop: true });
                 break;
             }
-            if (safe.length >= LIMITS.maxActionsPerReply || remainingMs < LIMITS.minDurationMs) break;
+            if (safe.length >= LIMITS.maxActionsPerReply) break;
 
             const step = {};
             const requested = Math.floor(finiteNumber(original.duration, LIMITS.defaultDurationMs));
             const duration = Math.min(
                 LIMITS.maxDurationMs,
                 Math.max(LIMITS.minDurationMs, requested),
-                remainingMs,
             );
-            if (duration < LIMITS.minDurationMs) break;
 
             if (original.vibrate !== undefined && Number.isFinite(Number(original.vibrate))) {
                 step.vibrate = clamp(Number(original.vibrate), 0, LIMITS.maxIntensity);
@@ -506,7 +504,6 @@
 
             step.duration = duration;
             safe.push(step);
-            remainingMs -= duration;
         }
 
         if (safe.length < parsed.length) {
@@ -523,44 +520,91 @@
         const safeSteps = applyHardLimits(steps);
         if (!safeSteps.length) return;
 
+        const isAISequence = source === 'AI 回复';
         const runId = ++currentRunId;
-        log(`${source}：开始执行 ${safeSteps.length} 个有序步骤`);
+        const startedAt = Date.now();
+        const deadline = startedAt + (isAISequence ? LIMITS.maxRunDurationMs : Number.MAX_SAFE_INTEGER);
+        let watchdog = null;
+
+        if (isAISequence) {
+            watchdog = setTimeout(() => {
+                if (runId !== currentRunId) return;
+                currentRunId++;
+                log(`达到 ${LIMITS.maxRunDurationMs / 1000} 秒最长运行时间，自动停止设备`, 'warn');
+                stopAllDevices();
+            }, LIMITS.maxRunDurationMs);
+        }
+
+        log(`${source}：载入 ${safeSteps.length} 个有序步骤${isAISequence ? `，循环运行，最长 ${LIMITS.maxRunDurationMs / 1000} 秒` : '，单次执行'}`);
+
         try {
-            for (let index = 0; index < safeSteps.length; index++) {
-                if (runId !== currentRunId || !settings.enabled && source === 'AI 回复') break;
-                const step = safeSteps[index];
+            let cycle = 0;
+            let stopRequested = false;
 
-                if (step.stop) {
-                    await stopAllDevices();
-                    log('序列包含停止指令，后续步骤已取消');
-                    break;
-                }
+            while (runId === currentRunId && Date.now() < deadline &&
+                   (isAISequence ? settings.enabled : true)) {
+                cycle++;
+                let sentInCycle = 0;
 
-                const targetIndices = [...devices.keys()];
-                let sent = false;
-                for (const deviceIndex of targetIndices) {
-                    try {
-                        const result = await setActuators(deviceIndex, step);
-                        sent = sent || result;
-                    } catch (error) {
-                        log(`设备 ${deviceIndex} 指令失败：${error.message}`, 'error');
+                for (let index = 0; index < safeSteps.length; index++) {
+                    if (runId !== currentRunId || Date.now() >= deadline ||
+                        (isAISequence && !settings.enabled)) break;
+
+                    const step = safeSteps[index];
+                    if (step.stop) {
+                        await stopAllDevices();
+                        log('序列包含停止指令，后续动作及循环已取消');
+                        stopRequested = true;
+                        break;
                     }
-                }
-                if (!sent) {
-                    log('当前步骤没有匹配到设备支持的功能，已跳过（不会用其他动作代替）', 'warn');
-                } else {
+
+                    const remainingMs = deadline - Date.now();
+                    if (remainingMs < LIMITS.minDurationMs) break;
+
+                    const targetIndices = [...devices.keys()];
+                    let sent = false;
+                    for (const deviceIndex of targetIndices) {
+                        if (runId !== currentRunId) break;
+                        try {
+                            const result = await setActuators(deviceIndex, step);
+                            sent = sent || result;
+                        } catch (error) {
+                            log(`设备 ${deviceIndex} 指令失败：${error.message}`, 'error');
+                        }
+                    }
+
+                    if (runId !== currentRunId) break;
+
+                    if (!sent) {
+                        log('当前步骤没有匹配到设备支持的功能，已跳过（不会用其他动作代替）', 'warn');
+                        continue;
+                    }
+
+                    sentInCycle++;
+                    const actualDuration = Math.max(0, Math.min(step.duration, deadline - Date.now()));
                     const labels = [];
                     if (step.vibrate !== undefined) labels.push(`震动 ${Math.round(step.vibrate * 100)}%`);
                     if (step.suck !== undefined) labels.push(`气泵 ${Math.round(step.suck * 100)}%`);
-                    log(`步骤 ${index + 1}/${safeSteps.length}：${labels.join(' + ')}，${step.duration}ms`);
-                    await sleep(step.duration);
+                    log(`循环 ${cycle} · 步骤 ${index + 1}/${safeSteps.length}：${labels.join(' + ')}，${Math.round(actualDuration)}ms`);
+                    if (actualDuration > 0) await sleep(actualDuration);
+
+                    if (runId !== currentRunId) break;
+                    await stopAllDevices();
+
+                    const gap = Math.min(LIMITS.gapBetweenActionsMs, Math.max(0, deadline - Date.now()));
+                    if (gap > 0 && Date.now() < deadline) await sleep(gap);
                 }
 
-                if (runId !== currentRunId) break;
-                await stopAllDevices();
-                if (index < safeSteps.length - 1) await sleep(LIMITS.gapBetweenActionsMs);
+                if (stopRequested || runId !== currentRunId || Date.now() >= deadline ||
+                    (isAISequence && !settings.enabled)) break;
+
+                if (sentInCycle === 0) {
+                    log('本轮没有成功发送任何设备动作，停止循环以避免空转', 'warn');
+                    break;
+                }
             }
         } finally {
+            if (watchdog) clearTimeout(watchdog);
             if (runId === currentRunId) await stopAllDevices();
             log('本次序列结束');
         }
@@ -677,7 +721,7 @@
         loadSettings();
         initUI();
         log(`安全序列控制器 ${PLUGIN_VERSION} 已加载`);
-        log(`硬限制：强度≤${Math.round(LIMITS.maxIntensity * 100)}%，单步≤${LIMITS.maxDurationMs}ms，单回复≤${LIMITS.maxActionsPerReply}步 / ${LIMITS.maxTotalDurationMs}ms`);
+        log(`硬限制：强度≤${Math.round(LIMITS.maxIntensity * 100)}%，单步≤${LIMITS.maxDurationMs}ms，AI 序列循环≤${LIMITS.maxRunDurationMs / 1000}秒，每轮≤${LIMITS.maxActionsPerReply}步`);
 
         getContextFn = await resolveContext();
         if (!getContextFn) {
