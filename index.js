@@ -6,7 +6,7 @@
     'use strict';
 
     const PLUGIN_NAME = 'IntifaceSafeSequence';
-    const PLUGIN_VERSION = '1.1.0-safe';
+    const PLUGIN_VERSION = '1.1.1-safe';
     const SETTINGS_KEY = 'intiface_safe_sequence_settings';
 
     // Hard safety limits: these are enforced in code, not supplied by the model.
@@ -142,9 +142,8 @@
 
         if (!$('#intiface-safe-sequence-drawer').length) {
             $('#extensions_settings').append(html);
-            $('#intiface-safe-sequence-drawer .inline-drawer-toggle').on('click', function () {
-                $(this).next('.inline-drawer-content').toggle();
-            });
+            // SillyTavern/SillyDroid already handles .inline-drawer-toggle clicks.
+            // Do not bind a second toggle handler here: it would open and immediately close the drawer.
             $('#ifs-connect').on('click', () => {
                 settings.serverAddress = String($('#ifs-server-address').val() || '').trim();
                 saveSettings();
